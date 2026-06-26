@@ -92,6 +92,61 @@ function buildMonthsRange(earliestDate, latestDate) {
 function storageGet(key) { try { const raw = localStorage.getItem(key); return raw === null ? null : JSON.parse(raw); } catch (e) { return null; } }
 function storageSet(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { return false; } }
 
+/* ---- AI context builder: compact summary by default, detail only when the question needs it ---- */
+function buildAIContext(transactions, categories, initialBalance, symbol, question) {
+  const catMap = {}; categories.forEach((c) => { catMap[c.id] = c.name; });
+  const totalIncome = transactions.filter((t) => t.type === "income").reduce((s, t) => s + t.amount, 0);
+  const totalExpense = transactions.filter((t) => t.type === "expense").reduce((s, t) => s + t.amount, 0);
+  const currentBalance = initialBalance + totalIncome - totalExpense;
+
+  const now = new Date();
+  const monthBuckets = [];
+  for (let i = 2; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    monthBuckets.push({ year: d.getFullYear(), month: d.getMonth(), label: `${MONTH_LABELS[d.getMonth()]} ${d.getFullYear()}` });
+  }
+  const catSummaryLines = categories.map((c) => {
+    const parts = monthBuckets.map((b) => {
+      const tx = transactions.filter((t) => { if (t.categoryId !== c.id) return false; const dd = parseISODate(t.date); return dd.getFullYear() === b.year && dd.getMonth() === b.month; });
+      const inc = tx.filter((t) => t.type === "income").reduce((s, t) => s + t.amount, 0);
+      const exp = tx.filter((t) => t.type === "expense").reduce((s, t) => s + t.amount, 0);
+      return `${b.label}: -${formatExact(exp)}/+${formatExact(inc)}`;
+    });
+    return `${c.name}: ${parts.join(", ")}`;
+  });
+
+  const q = (question || "").toLowerCase();
+  const wantsDetail =
+    /\b(today|yesterday|this week|last week|this month|last month|on |date|when|list|show me|which|specific|each|every|recent)\b/.test(q) ||
+    categories.some((c) => q.includes(c.name.toLowerCase())) ||
+    MONTH_LABELS.some((m) => q.includes(m.toLowerCase()));
+
+  let detailBlock = "";
+  if (wantsDetail) {
+    const relevant = [...transactions]
+      .sort((a, b) => (b.date + String(b.createdAt)).localeCompare(a.date + String(a.createdAt)))
+      .slice(0, 80)
+      .map((t) => `${t.date} | ${t.type} | ${formatExact(t.amount)} | ${catMap[t.categoryId] || "Uncategorized"} | ${t.description}`);
+    detailBlock = `\n\nMost recent matching transactions (up to 80, date | type | amount | category | description):\n${relevant.join("\n")}`;
+  }
+
+  return `Currency symbol: ${symbol}\nInitial balance: ${formatExact(initialBalance)}\nCurrent balance: ${formatExact(currentBalance)}\nTotal income (all time): ${formatExact(totalIncome)}\nTotal expense (all time): ${formatExact(totalExpense)}\n\nPer-category totals, last 3 months (expense/income):\n${catSummaryLines.join("\n")}${detailBlock}`;
+}
+
+function bumpAndGetDailyAICount() {
+  const today = todayISO();
+  const data = storageGet("klarity-flow:ai-usage") || { date: today, count: 0 };
+  if (data.date !== today) { data.date = today; data.count = 0; }
+  data.count += 1;
+  storageSet("klarity-flow:ai-usage", data);
+  return data.count;
+}
+function getDailyAICount() {
+  const data = storageGet("klarity-flow:ai-usage");
+  if (!data || data.date !== todayISO()) return 0;
+  return data.count;
+}
+
 /* ====================== UI ATOMS ====================== */
 function Card({ children, style, className = "" }) {
   const t = useTheme();
@@ -253,6 +308,80 @@ function MiniLineChart({ data }) {
   );
 }
 
+/* ====================== AI ASSISTANT (via your own Cloudflare Worker + Gemini) ====================== */
+function AIAssistantView({ transactions, categories, initialBalance, symbol, settings }) {
+  const t = useTheme();
+  const [messages, setMessages] = useState([{ role: "model", text: "Hi! Ask me about your spending, income, or categories — for example: \"How much did I spend on Food & Drink this month?\"" }]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [todayCount, setTodayCount] = useState(getDailyAICount());
+  const scrollRef = useRef(null);
+  const configured = !!(settings.aiBackendUrl && settings.aiBackendUrl.trim());
+
+  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages, loading]);
+
+  async function send(text) {
+    const userText = (text !== undefined ? text : input).trim();
+    if (!userText || !configured) return;
+    const history = messages.slice(-8);
+    setMessages((m) => [...m, { role: "user", text: userText }]);
+    setInput("");
+    setLoading(true);
+    try {
+      const contents = [
+        ...history.map((m) => ({ role: m.role === "user" ? "user" : "model", parts: [{ text: m.text }] })),
+        { role: "user", parts: [{ text: userText }] },
+      ];
+      const systemPrompt = `You are the in-app finance assistant for Klarity Flow, a personal daily cash-flow tracking app. Answer using ONLY the data below. Be concise and specific. Always state exact figures (never round). If something can't be answered from the data, say so plainly.\n\n${buildAIContext(transactions, categories, initialBalance, symbol, userText)}`;
+      const res = await fetch(settings.aiBackendUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-App-Secret": settings.aiSecret || "" },
+        body: JSON.stringify({ systemPrompt, contents }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(typeof data.error === "string" ? data.error : "Request failed");
+      const candidate = data.candidates && data.candidates[0];
+      const textOut = (candidate && candidate.content && candidate.content.parts && candidate.content.parts.map((p) => p.text || "").join("").trim()) || "I couldn't generate a response — try rephrasing.";
+      setMessages((m) => [...m, { role: "model", text: textOut }]);
+      setTodayCount(bumpAndGetDailyAICount());
+    } catch (e) {
+      setMessages((m) => [...m, { role: "model", text: "Sorry, I couldn't reach the assistant just now (" + e.message + "). Check your AI Backend URL and Secret in Settings." }]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (!configured) {
+    return (
+      <div>
+        <SectionTitle icon="🤖" title="AI Assistant" />
+        <Card className="p-4">
+          <div className="text-sm font-semibold mb-1" style={{ color: t.textPrimary }}>Not set up yet</div>
+          <div style={{ color: t.textMuted, fontSize: "12px" }}>Once you've deployed the Cloudflare Worker, paste its URL (and your app secret) into Settings → AI Assistant Setup, then come back here.</div>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col" style={{ height: "calc(100vh - 160px)" }}>
+      <SectionTitle icon="🤖" title="AI Assistant" right={<span style={{ color: t.textMuted, fontSize: "10px" }}>{todayCount} today</span>} />
+      <div ref={scrollRef} className="flex-1 overflow-y-auto flex flex-col gap-2 mb-3">
+        {messages.map((m, i) => (
+          <div key={i} className="flex" style={{ justifyContent: m.role === "user" ? "flex-end" : "flex-start" }}>
+            <div className="text-sm px-3.5 py-2.5 rounded-2xl whitespace-pre-wrap" style={{ background: m.role === "user" ? t.blueSoft : t.bgCard, color: t.textPrimary, border: `1px solid ${m.role === "user" ? t.blue : t.border}`, maxWidth: "85%" }}>{m.text}</div>
+          </div>
+        ))}
+        {loading && <div className="flex justify-start"><div className="px-3.5 py-2.5 rounded-2xl" style={{ background: t.bgCard, border: `1px solid ${t.border}`, color: t.textSecondary, fontSize: "12px" }}>Thinking…</div></div>}
+      </div>
+      <div className="flex gap-2">
+        <input value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") send(); }} placeholder="Ask about your finances…" className="flex-1 text-sm px-3.5 py-2.5 rounded-xl outline-none" style={{ background: t.bgInput, color: t.textPrimary, border: `1px solid ${t.border}` }} />
+        <button onClick={() => send()} disabled={loading} className="rounded-xl px-4" style={{ background: t.green, opacity: loading ? 0.6 : 1, color: "#0A0A0A", fontWeight: 700 }}>➤</button>
+      </div>
+    </div>
+  );
+}
+
 /* ====================== TOP BAR + SIDEBAR ====================== */
 function TopBar({ onMenu, onSearch }) {
   const t = useTheme();
@@ -276,6 +405,7 @@ function Sidebar({ open, onClose, view, setView }) {
     { id: "analytics", label: "Expense Category", icon: "📊" },
     { id: "reports", label: "Reports", icon: "📋" },
     { id: "search", label: "Search", icon: "🔍" },
+    { id: "ai", label: "AI Assistant", icon: "🤖" },
     { id: "importExport", label: "Import & Export", icon: "⬇️" },
     { id: "settings", label: "Settings", icon: "⚙️" },
   ];
@@ -878,8 +1008,20 @@ function SettingsView({ settings, setSettings, pushToast, onResetAll }) {
         </div>
       </Card>
       <Card className="p-4 mb-3">
-        <div className="text-sm font-semibold mb-1" style={{ color: t.textPrimary }}>AI Assistant & Receipt Scanner</div>
-        <div style={{ color: t.textMuted, fontSize: "12px" }}>These two features need a small server to keep an API key private, so they're not in this phone-only version. They're ready and waiting in the full project (the one built for Vercel) whenever you get access to a computer.</div>
+        <div className="text-sm font-semibold mb-1" style={{ color: t.textPrimary }}>AI Assistant Setup</div>
+        <div className="mb-3" style={{ color: t.textMuted, fontSize: "12px" }}>Paste the Cloudflare Worker URL and the App Secret you set up for it. Both stay only on this device.</div>
+        <div className="mb-2">
+          <div className="mb-1" style={{ color: t.textSecondary, fontSize: "11px" }}>Worker URL</div>
+          <input value={settings.aiBackendUrl || ""} onChange={(e) => setSettings((s) => ({ ...s, aiBackendUrl: e.target.value.trim() }))} placeholder="https://your-worker.your-name.workers.dev" className="w-full text-sm px-3 py-2 rounded-lg outline-none" style={{ background: t.bgInput, color: t.textPrimary, border: `1px solid ${t.border}`, fontFamily: "monospace", fontSize: "12px" }} />
+        </div>
+        <div>
+          <div className="mb-1" style={{ color: t.textSecondary, fontSize: "11px" }}>App Secret</div>
+          <input value={settings.aiSecret || ""} onChange={(e) => setSettings((s) => ({ ...s, aiSecret: e.target.value }))} placeholder="the same secret you put in the Worker" className="w-full text-sm px-3 py-2 rounded-lg outline-none" style={{ background: t.bgInput, color: t.textPrimary, border: `1px solid ${t.border}`, fontFamily: "monospace", fontSize: "12px" }} />
+        </div>
+      </Card>
+      <Card className="p-4 mb-3">
+        <div className="text-sm font-semibold mb-1" style={{ color: t.textPrimary }}>Receipt Scanner</div>
+        <div style={{ color: t.textMuted, fontSize: "12px" }}>Not included in this phone-only version yet — it needs image upload support added to the Worker. The AI Assistant works the same way either way.</div>
       </Card>
       <Card className="p-4">
         <div className="text-sm font-semibold mb-1" style={{ color: t.textPrimary }}>Reset all data</div>
@@ -962,6 +1104,7 @@ function App() {
           {view === "analytics" && <ExpenseAnalyticsView categories={categories} transactions={transactions} symbol={symbol} />}
           {view === "reports" && <ReportsView transactions={transactions} symbol={symbol} />}
           {view === "search" && <SearchView transactions={transactions} categories={categories} selectedYear={selectedYear} setSelectedYear={setSelectedYear} />}
+          {view === "ai" && <AIAssistantView transactions={transactions} categories={categories} initialBalance={initialBalance} symbol={symbol} settings={settings} />}
           {view === "importExport" && <ImportExportView initialBalance={initialBalance} transactions={transactions} categories={categories} shortcuts={shortcuts} setTransactions={setTransactions} setCategories={setCategories} pushToast={pushToast} />}
           {view === "settings" && <SettingsView settings={settings} setSettings={setSettings} pushToast={pushToast} onResetAll={handleResetAll} />}
         </main>
